@@ -53,7 +53,7 @@ sequenceDiagram
     G->>GH: git clone with each private key and fix HEAD
     G->>W: POST /updates/grading (run_id per task evaluation)
     G->>W: POST /updates/graded (immutable task result)
-    W->>D1: publish result; preserve pending push
+    W->>D1: publish result and preserve pending push
     G->>W: POST /updates/acknowledged (completed run evidence)
     W->>D1: clear only matching pending update
     Student->>W: GET /leaderboard (public results)
