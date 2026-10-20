@@ -1,0 +1,23 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "grader-worker",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "observability": { "enabled": true },
+
+  // Browser origins allowed to call the API (CORS), comma-separated, e.g. the Hugo site hosting
+  // admin/index.html: "https://example.com". Empty = no browser access. Locally, .dev.vars overrides it.
+  "vars": { "ALLOWED_ORIGINS": "http://127.0.0.1:1313, http://localhost:8080, https://fra179.github.io" },
+
+  "routes": [{ "pattern": "grader-api.francescodb.me", "custom_domain": true }],
+  "workers_dev": false,
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "grader-db",
+      "database_id": "c4b75266-536d-423c-88ed-b7b0430fee0a",
+      "migrations_dir": "migrations"
+    }
+  ]
+}

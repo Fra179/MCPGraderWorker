@@ -1,0 +1,4 @@
+# Copy to .dev.vars for `npm run dev`. `scripts/admin-keys.sh dev-vars` fills ADMIN_PUBLIC_KEYS for you.
+ADMIN_PUBLIC_KEYS={}
+# Origin of the page calling the API locally (`npm run admin` serves admin/ here; also Hugo's default port).
+ALLOWED_ORIGINS=http://localhost:1313,http://127.0.0.1:1313

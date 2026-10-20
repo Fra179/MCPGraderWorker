@@ -1,0 +1,1274 @@
+openapi: 3.0.3
+info:
+  title: Grader worker API
+  version: 3.0.0
+  description: |
+    Collects student submissions for the grader. Students submit a repository URL and get back a deploy key
+    and a push-webhook secret. Admins list, delete and manage submissions with signed requests.
+
+    All request and response bodies are JSON. Errors are `{"error": "<message>"}`.
+
+    ## Admin authentication (signed requests)
+
+    Endpoints marked with the `adminSignature` security scheme need two headers:
+
+    - `X-Grader-Timestamp`: current unix time in seconds, as an integer string.
+    - `X-Grader-Signature`: base64 of the raw 64-byte `r||s` ECDSA P-256 / SHA-256 signature
+      (WebCrypto format, not DER).
+
+    The signed bytes are four lines joined by `\n`, with no trailing newline, encoded as UTF-8:
+
+    ```
+    METHOD
+    /path?query
+    timestamp
+    hex(sha256(body))
+    ```
+
+    - `METHOD` is uppercase.
+    - `/path?query` is exactly what is sent on the request line, with no host. Without a query it is just the path.
+    - `timestamp` is the same string as the header.
+    - The body hash is lowercase hex of the raw body bytes you send. For an empty body (GET) it is the SHA-256 of the
+      empty string, `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
+    - Serialize the JSON body once and sign those exact bytes.
+
+    A timestamp more than 60 seconds from server time is rejected with 401, so keep the client clock accurate.
+    A valid signature from none of the authorized keys is rejected with 403.
+    Reference implementation: `examples/client.py`.
+
+    ## CORS
+
+    Browsers may only call the API from origins listed in the worker's `ALLOWED_ORIGINS`. Server-side clients are unaffected.
+servers:
+  - url: https://grader-api.francescodb.me
+    description: Production
+  - url: http://localhost:8787
+    description: Local `npm run dev`
+tags:
+  - name: Students
+  - name: Admin
+  - name: GitHub
+  - name: Leaderboard
+
+paths:
+  /submit:
+    post:
+      tags: [Students]
+      summary: Submit a repository
+      description: |
+        Stores the submission and returns what the student must add to the repository: the deploy key's public half
+        (GitHub, Settings, Deploy keys) and the URL and secret for the push webhook (GitHub, Settings, Webhooks,
+        content type `application/json`, push events).
+
+        `webhook_secret` is returned only here and when an admin rotates it. It is never listed afterwards, so show it
+        to the student right away.
+
+        A repository counts as already submitted when its normalized SSH URL matches, whatever the assignment.
+        `https://github.com/A/B`, `https://github.com/a/b.git/` and `git@github.com:a/b.git` are the same repository.
+        A student (`student_id`) can submit only one repository per assignment.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SubmitRequest"
+      responses:
+        "201":
+          description: Submission stored.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubmitResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          description: The repository was already submitted, or this student already submitted this assignment.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "415":
+          $ref: "#/components/responses/BadRequest"
+
+  /submissions:
+    get:
+      tags: [Admin]
+      summary: List submissions
+      description: |
+        Same as `POST /submissions`, with the filters as query parameters. The query string is part of the signed
+        path. URL-encode a `+` in a timezone offset as `%2B`.
+      security:
+        - adminSignature: []
+      parameters:
+        - $ref: "#/components/parameters/AssignmentName"
+        - $ref: "#/components/parameters/PushedAfter"
+        - $ref: "#/components/parameters/OrderBy"
+        - $ref: "#/components/parameters/Timestamp"
+        - $ref: "#/components/parameters/Signature"
+      responses:
+        "200":
+          $ref: "#/components/responses/SubmissionList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    post:
+      tags: [Admin]
+      summary: List submissions (filters in the body)
+      description: Exists because GET can't carry a body. All fields are optional, and an empty body lists everything.
+      security:
+        - adminSignature: []
+      parameters:
+        - $ref: "#/components/parameters/Timestamp"
+        - $ref: "#/components/parameters/Signature"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ListRequest"
+      responses:
+        "200":
+          $ref: "#/components/responses/SubmissionList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    delete:
+      tags: [Admin]
+      summary: Delete one submission
+      description: This request carries a JSON body, and the body is part of the signature.
+      security:
+        - adminSignature: []
+      parameters:
+        - $ref: "#/components/parameters/Timestamp"
+        - $ref: "#/components/parameters/Signature"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IdRequest"
+      responses:
+        "200":
+          description: Deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [deleted]
+                properties:
+                  deleted:
+                    type: integer
+                    enum: [1]
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /assignment:
+    delete:
+      tags: [Admin]
+      summary: Delete every submission of an assignment
+      description: Deleting an assignment with no submissions is not an error (`deleted` is 0). The body is part of the signature.
+      security:
+        - adminSignature: []
+      parameters:
+        - $ref: "#/components/parameters/Timestamp"
+        - $ref: "#/components/parameters/Signature"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [assignment_name]
+              properties:
+                assignment_name:
+                  $ref: "#/components/schemas/Text"
+      responses:
+        "200":
+          description: Deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [deleted]
+                properties:
+                  deleted:
+                    type: integer
+                    minimum: 0
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /updates:
+    get:
+      tags: [Admin]
+      summary: Read pending submissions without consuming them
+      description: |
+        Returns one row per pending repository, ordered by last_push, with all submission fields plus update_id.
+        Each recorded push increments the submission's update version. Repeated reads retain pending work.
+        Acknowledge explicitly through POST /updates/acknowledged using completed run evidence for every applicable task.
+        This replaces the former consuming-read behavior.
+      security:
+        - adminSignature: []
+      parameters:
+        - $ref: "#/components/parameters/Timestamp"
+        - $ref: "#/components/parameters/Signature"
+      responses:
+        "200":
+          description: Pending submissions, including their private deploy keys.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [submissions]
+                properties:
+                  submissions:
+                    type: array
+                    items:
+                      allOf:
+                        - $ref: "#/components/schemas/Submission"
+                        - type: object
+                          required: [update_id]
+                          properties:
+                            update_id:
+                              $ref: "#/components/schemas/UpdateId"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /updates/grading:
+    post:
+      tags:
+      - Admin
+      summary: Start one task evaluation independently of pushes
+      description: 'Persist a coordinator-generated run_id before calling. A new evaluation requires the
+        current previous_run_id (null for the first run) and no active run. Each accepted start gets an
+        increasing task revision. update_id is required but nullable, and may reference an acknowledged
+        push; a nonnull future version conflicts. The actual pinned commit and configuration fingerprint
+        are immutable. Previous completed results remain visible. Identical retries preserve start time
+        and return the original current state, even after later runs. Reused IDs with different payloads
+        or stale predecessors return 409. One run spans scheduler retries. Maximum body: 1 MiB.'
+      security:
+      - adminSignature: []
+      parameters:
+      - $ref: '#/components/parameters/Timestamp'
+      - $ref: '#/components/parameters/Signature'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+              - $ref: '#/components/schemas/TaskRun'
+              - type: object
+                required:
+                - previous_run_id
+                - update_id
+                - name
+                - commit_hash
+                - perf_hash
+                properties:
+                  previous_run_id:
+                    type: string
+                    format: uuid
+                    nullable: true
+                  update_id:
+                    type: integer
+                    minimum: 1
+                    maximum: 9007199254740991
+                    nullable: true
+                  name:
+                    $ref: '#/components/schemas/Text'
+                  commit_hash:
+                    $ref: '#/components/schemas/CommitHash'
+                  perf_hash:
+                    $ref: '#/components/schemas/Text'
+      responses:
+        '200':
+          description: Operation accepted or identical retry.
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/RunState'
+                - type: object
+                  required:
+                  - created
+                  properties:
+                    created:
+                      type: boolean
+        '201':
+          description: New evaluation accepted; revision allocated.
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/RunState'
+                - type: object
+                  required:
+                  - created
+                  properties:
+                    created:
+                      type: boolean
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/GradingConflict'
+        '413':
+          $ref: '#/components/responses/GradingTooLarge'
+  /updates/graded:
+    post:
+      tags:
+      - Admin
+      summary: Publish an immutable final task result; never acknowledges a push
+      description: 'Requires the latest active run and its pinned commit. Atomically saves the result and
+        clears only that run. Identical normalized retries return saved=false even after later evaluations
+        or historical payload expiry. Object key order is ignored recursively; array order is preserved;
+        defaults and JavaScript JSON number encoding are normalized. Changed completed results, mismatched
+        commits/tasks and cancelled runs conflict. Corrected grades need a new run. The removed complete
+        field is rejected with 400 even if false. Maximum body: 1 MiB.'
+      security:
+      - adminSignature: []
+      parameters:
+      - $ref: '#/components/parameters/Timestamp'
+      - $ref: '#/components/parameters/Signature'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+              - $ref: '#/components/schemas/TaskRun'
+              - type: object
+                required:
+                - grading
+                properties:
+                  grading:
+                    $ref: '#/components/schemas/TaskGrading'
+                not:
+                  required:
+                  - complete
+      responses:
+        '200':
+          description: Operation accepted or identical retry.
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/RunState'
+                - type: object
+                  required:
+                  - saved
+                  properties:
+                    saved:
+                      type: boolean
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/GradingConflict'
+        '413':
+          $ref: '#/components/responses/GradingTooLarge'
+  /updates/cancelled:
+    post:
+      tags:
+      - Admin
+      summary: Abandon an evaluation while preserving previous results
+      description: 'Cancels only the specified active run. Identical retries succeed with cancelled=false;
+        changed reasons or completed runs conflict. Does not stop scheduler jobs or resolve uncertain scheduler
+        submissions. Replacement scheduler attempts normally stay within the existing run. Maximum body:
+        1 MiB.'
+      security:
+      - adminSignature: []
+      parameters:
+      - $ref: '#/components/parameters/Timestamp'
+      - $ref: '#/components/parameters/Signature'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+              - $ref: '#/components/schemas/TaskRun'
+              - type: object
+                required:
+                - reason
+                properties:
+                  reason:
+                    $ref: '#/components/schemas/Text'
+      responses:
+        '200':
+          description: Operation accepted or identical retry.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - run_id
+                - state
+                - cancelled
+                properties:
+                  run_id:
+                    type: string
+                    format: uuid
+                  state:
+                    type: string
+                    enum:
+                    - cancelled
+                  cancelled:
+                    type: boolean
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/GradingConflict'
+        '413':
+          $ref: '#/components/responses/GradingTooLarge'
+  /updates/acknowledged:
+    post:
+      tags:
+      - Admin
+      summary: Acknowledge a push with newly completed or unchanged-result evidence
+      description: 'The coordinator persists the applicable task set and verifies repository, pinned commit
+        and fingerprints locally. runs maps each applicable task to a completed run belonging to that submission/task;
+        its update_id may be older or null. An empty map explicitly declares no applicable tasks. The Worker
+        trusts input eligibility. Transactionally checks version, then returns superseded or already_acknowledged
+        before checking obsolete evidence. For a matching marker, invalid evidence gives 409; active work
+        on cited tasks regardless of provenance or on any task for this update blocks deletion. A newer
+        push is never consumed. Retire outbox entries for acknowledged, already_acknowledged and superseded;
+        retain active_runs for reconciliation. pending_update_id reports the actual marker or null. Maximum
+        body: 1 MiB.'
+      security:
+      - adminSignature: []
+      parameters:
+      - $ref: '#/components/parameters/Timestamp'
+      - $ref: '#/components/parameters/Signature'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - id
+              - update_id
+              - runs
+              properties:
+                id:
+                  type: string
+                  format: uuid
+                update_id:
+                  $ref: '#/components/schemas/UpdateId'
+                runs:
+                  type: object
+                  description: Trimmed task names (1–512 characters) mapped to completed run UUIDs. Duplicate
+                    normalized tasks are rejected.
+                  additionalProperties:
+                    type: string
+                    format: uuid
+      responses:
+        '200':
+          description: Operation accepted or identical retry.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Acknowledgement'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/GradingConflict'
+        '413':
+          $ref: '#/components/responses/GradingTooLarge'
+  /grading:
+    get:
+      tags:
+      - Admin
+      summary: Inspect a run or discover task predecessors privately
+      description: 'Supply exactly one id or run_id selector; missing, duplicate or combined selectors return
+        400. Unknown submission/run returns 404. A submission with no runs has an empty task map. Legacy
+        tasks may have null run IDs and revision zero. Cache-Control: no-store. Historical payload expiry
+        preserves compact metadata, completed state and result_digest; grading becomes null and payload_available=false.'
+      security:
+      - adminSignature: []
+      parameters:
+      - $ref: '#/components/parameters/Timestamp'
+      - $ref: '#/components/parameters/Signature'
+      - name: id
+        in: query
+        schema:
+          type: string
+          format: uuid
+        description: 'Submission UUID: returns task state.'
+      - name: run_id
+        in: query
+        schema:
+          type: string
+          format: uuid
+        description: 'Run UUID: returns private run detail.'
+      responses:
+        '200':
+          description: Private run or task inspection.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - $ref: '#/components/schemas/GradingRun'
+                - $ref: '#/components/schemas/GradingTasks'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /leaderboard:
+    get:
+      tags: [Leaderboard]
+      summary: Public latest results and current grading state
+      description: |
+        Returns the existing leaderboard JSON format, keyed by assignment name, with additional task-keyed
+        is_grading, grading_started_at, grading_commit_hash, stdout_truncated and stdout_original_bytes maps. First-time active tasks have no completed
+        result values yet. Previous completed results remain visible during regrading. No emails or deploy keys
+        are returned. Deleting a submission deletes its leaderboard state. An empty result is {}.
+      security: []
+      parameters:
+        - name: assignment_name
+          in: query
+          description: Optional exact assignment name. Empty or whitespace-only values are rejected.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 512
+      responses:
+        "200":
+          description: Assignment names mapped to leaderboard entries.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  type: array
+                  items:
+                    $ref: "#/components/schemas/LeaderboardEntry"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /webhook-secret:
+    post:
+      tags: [Admin]
+      summary: Rotate a submission's webhook secret
+      description: |
+        Issues a new secret. The old one stops working immediately, so the student has to update the secret in the
+        repository's GitHub webhook.
+      security:
+        - adminSignature: []
+      parameters:
+        - $ref: "#/components/parameters/Timestamp"
+        - $ref: "#/components/parameters/Signature"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IdRequest"
+      responses:
+        "200":
+          description: New secret.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, webhook_url, webhook_secret]
+                properties:
+                  id:
+                    type: string
+                    format: uuid
+                  webhook_url:
+                    type: string
+                    format: uri
+                  webhook_secret:
+                    type: string
+                    description: 64 hex characters.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /webhook/github:
+    post:
+      tags: [GitHub]
+      summary: GitHub push webhook delivery
+      description: |
+        Called by GitHub, not by API clients. The submission is found from the delivery's repository, then
+        `X-Hub-Signature-256` must verify with that submission's webhook secret.
+
+        Any valid signed delivery, including `ping`, sets `webhook_seen_at`. Pushes to the repository's default branch
+        also set `last_push` and `last_commit`, and mark the repository for `GET /updates`.
+        `last_push` is the time the worker received the delivery, never the payload's `pushed_at`. Pushes to other branches, tags and branch deletions return 200 with `recorded: false`.
+
+        Error messages are written for the student, because GitHub shows them in the webhook's delivery log.
+      parameters:
+        - name: X-GitHub-Event
+          in: header
+          required: true
+          schema:
+            type: string
+            example: push
+        - name: X-Hub-Signature-256
+          in: header
+          required: true
+          description: "`sha256=` followed by the hex HMAC-SHA256 of the raw body, keyed with the webhook secret."
+          schema:
+            type: string
+      requestBody:
+        required: true
+        description: A GitHub webhook payload. Only the fields below are read.
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ref:
+                  type: string
+                  example: refs/heads/main
+                after:
+                  type: string
+                  description: Commit SHA after the push.
+                deleted:
+                  type: boolean
+                repository:
+                  type: object
+                  properties:
+                    full_name:
+                      type: string
+                    ssh_url:
+                      type: string
+                    clone_url:
+                      type: string
+                    html_url:
+                      type: string
+                    default_branch:
+                      type: string
+      responses:
+        "200":
+          description: Delivery accepted.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [event, recorded, last_push, last_commit]
+                    properties:
+                      event:
+                        type: string
+                      recorded:
+                        type: boolean
+                        enum: [true]
+                      last_push:
+                        type: string
+                        format: date-time
+                      last_commit:
+                        type: string
+                  - type: object
+                    required: [event, recorded, message]
+                    properties:
+                      event:
+                        type: string
+                      recorded:
+                        type: boolean
+                        enum: [false]
+                      message:
+                        type: string
+                        example: Webhook is set up correctly
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          description: Delivery unsigned, or the signature doesn't match the repository's secret.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "415":
+          $ref: "#/components/responses/BadRequest"
+
+components:
+  securitySchemes:
+    adminSignature:
+      type: apiKey
+      in: header
+      name: X-Grader-Signature
+      description: |
+        ECDSA P-256 signature, used together with `X-Grader-Timestamp`.
+        See the signing procedure in the API description. Swagger-style tooling can't compute it for you.
+
+  parameters:
+    Timestamp:
+      name: X-Grader-Timestamp
+      in: header
+      required: true
+      description: Unix time in seconds when the request was signed. Must be within 60 seconds of server time.
+      schema:
+        type: string
+        example: "1791900000"
+    Signature:
+      name: X-Grader-Signature
+      in: header
+      required: true
+      description: Base64 of the raw 64-byte `r||s` signature.
+      schema:
+        type: string
+    AssignmentName:
+      name: assignment_name
+      in: query
+      description: Only this assignment (exact match). Empty means all.
+      schema:
+        type: string
+    PushedAfter:
+      name: pushed_after
+      in: query
+      description: |
+        Only submissions whose `last_push` is strictly later. Rows that never pushed are excluded.
+        Unix seconds, or ISO 8601 with a timezone. A time without a timezone is rejected.
+      schema:
+        $ref: "#/components/schemas/Time"
+    OrderBy:
+      name: order_by
+      in: query
+      description: Ascending order. With `last_push`, rows that never pushed come last.
+      schema:
+        $ref: "#/components/schemas/OrderBy"
+
+  schemas:
+    Text:
+      type: string
+      minLength: 1
+      maxLength: 512
+      description: Trimmed before use. Whitespace-only is rejected.
+    Time:
+      description: Unix seconds (number or digit string), or ISO 8601 with an explicit timezone.
+      oneOf:
+        - type: integer
+          example: 1791900000
+        - type: string
+          example: "2026-10-10T20:00:00+02:00"
+    OrderBy:
+      type: string
+      enum: [created_at, last_push]
+      default: created_at
+    SubmitRequest:
+      type: object
+      required: [assignment_name, repo_url, student_id, email]
+      properties:
+        assignment_name:
+          $ref: "#/components/schemas/Text"
+        repo_url:
+          allOf:
+            - $ref: "#/components/schemas/Text"
+          description: "`http(s)://`, `ssh://` or `git@host:owner/repo`."
+          example: https://github.com/owner/repo
+        student_id:
+          type: integer
+          minimum: 1
+          description: Must be a JSON number, not a string.
+        email:
+          type: string
+          pattern: "^[^\\s@]+@studenti\\.uniroma1\\.it$"
+          description: Stored lowercased.
+    SubmitResponse:
+      type: object
+      required: [id, assignment_name, repo_url, repo_ssh_url, public_key, webhook_url, webhook_secret]
+      properties:
+        id:
+          type: string
+          format: uuid
+        assignment_name:
+          type: string
+        repo_url:
+          type: string
+        repo_ssh_url:
+          type: string
+          example: git@github.com:owner/repo.git
+        public_key:
+          type: string
+          description: OpenSSH public key to paste into GitHub's Deploy keys.
+          example: ecdsa-sha2-nistp256 AAAA... grader-hw1-1234567
+        webhook_url:
+          type: string
+          format: uri
+          description: Payload URL for the GitHub webhook.
+        webhook_secret:
+          type: string
+          description: 64 hex characters, for the webhook's Secret field. Not shown again.
+    ListRequest:
+      type: object
+      properties:
+        assignment_name:
+          type: string
+          nullable: true
+        pushed_after:
+          allOf:
+            - $ref: "#/components/schemas/Time"
+          nullable: true
+        order_by:
+          $ref: "#/components/schemas/OrderBy"
+    IdRequest:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string
+          format: uuid
+    Submission:
+      type: object
+      required:
+        - id
+        - assignment_name
+        - repo_url
+        - repo_ssh_url
+        - student_id
+        - email
+        - private_key
+        - created_at
+        - webhook_seen_at
+        - last_push
+        - last_commit
+      properties:
+        id:
+          type: string
+          format: uuid
+        assignment_name:
+          type: string
+        repo_url:
+          type: string
+        repo_ssh_url:
+          type: string
+        student_id:
+          type: integer
+        email:
+          type: string
+        private_key:
+          type: string
+          description: PKCS#8 PEM deploy key, usable with `ssh -i`. Treat as a secret.
+        created_at:
+          type: string
+        webhook_seen_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Last signed delivery of any kind (including `ping`). Null means the webhook was never set up correctly.
+        last_push:
+          type: string
+          format: date-time
+          nullable: true
+          description: When the worker received the latest push to the default branch. Null if none.
+        last_commit:
+          type: string
+          nullable: true
+          description: Commit SHA of that push. A student can forge it, so use it only as a hint.
+    UpdateId:
+      type: integer
+      minimum: 1
+      description: Monotonic version scoped to a submission, obtained from GET /updates; not a commit hash.
+    CommitHash:
+      type: string
+      pattern: "^([0-9a-f]{40}|[0-9a-f]{64})$"
+      description: Actual fixed lowercase Git commit; all-zero hashes are rejected.
+    TaskRun:
+      type: object
+      required:
+      - id
+      - task
+      - run_id
+      properties:
+        id:
+          type: string
+          format: uuid
+        task:
+          $ref: '#/components/schemas/Text'
+        run_id:
+          type: string
+          format: uuid
+    RunState:
+      type: object
+      required:
+      - run_id
+      - revision
+      - state
+      properties:
+        run_id:
+          type: string
+          format: uuid
+        revision:
+          type: integer
+          minimum: 1
+        state:
+          type: string
+          enum:
+          - active
+          - completed
+          - cancelled
+    TaskGrading:
+      type: object
+      required:
+      - commit_hash
+      - status
+      - error
+      - stdout
+      - runtimes
+      - avg_runtime
+      - data
+      - reduction
+      properties:
+        commit_hash:
+          $ref: '#/components/schemas/CommitHash'
+        status:
+          type: string
+          enum:
+          - graded
+          - error
+          - timeout
+        error:
+          type: string
+        stdout:
+          type: string
+        runtimes:
+          type: array
+          items:
+            type: number
+            minimum: 0
+        avg_runtime:
+          type: number
+          minimum: 0
+        data:
+          type: object
+          additionalProperties: true
+        reduction:
+          $ref: '#/components/schemas/Text'
+        stdout_truncated:
+          type: boolean
+          default: false
+        stdout_original_bytes:
+          type: integer
+          minimum: 0
+          maximum: 9007199254740991
+          description: Defaults to transmitted stdout UTF-8 byte count.
+      description: Scalar task result. Numbers must be finite. Empty runtimes require avg_runtime=0. Optional
+        truncation counts measure UTF-8 stdout bytes; a truncated result must explicitly supply true and an
+        original byte count greater than transmitted bytes. Otherwise any count must equal transmitted bytes.
+    Acknowledgement:
+      type: object
+      required:
+      - update_id
+      - acknowledged
+      - reason
+      - pending_update_id
+      properties:
+        update_id:
+          $ref: '#/components/schemas/UpdateId'
+        acknowledged:
+          type: boolean
+          description: True only when this request deleted the matching marker; false does not by itself imply
+            retry.
+        reason:
+          type: string
+          enum:
+          - acknowledged
+          - already_acknowledged
+          - superseded
+          - active_runs
+        pending_update_id:
+          type: integer
+          minimum: 1
+          maximum: 9007199254740991
+          nullable: true
+    GradingRun:
+      allOf:
+      - $ref: '#/components/schemas/TaskRun'
+      - type: object
+        required:
+        - revision
+        - previous_run_id
+        - update_id
+        - name
+        - commit_hash
+        - perf_hash
+        - state
+        - started_at
+        - terminal_at
+        - cancellation_reason
+        - result_digest
+        - superseded_at
+        - payload_available
+        - grading
+        properties:
+          revision:
+            type: integer
+            minimum: 1
+          previous_run_id:
+            type: string
+            format: uuid
+            nullable: true
+          update_id:
+            type: integer
+            minimum: 1
+            maximum: 9007199254740991
+            nullable: true
+          name:
+            $ref: '#/components/schemas/Text'
+          commit_hash:
+            $ref: '#/components/schemas/CommitHash'
+          perf_hash:
+            $ref: '#/components/schemas/Text'
+          state:
+            type: string
+            enum:
+            - active
+            - completed
+            - cancelled
+          started_at:
+            type: string
+            format: date-time
+          terminal_at:
+            type: string
+            format: date-time
+            nullable: true
+          cancellation_reason:
+            type: string
+            nullable: true
+          result_digest:
+            type: string
+            nullable: true
+          superseded_at:
+            type: string
+            format: date-time
+            nullable: true
+          payload_available:
+            type: boolean
+          grading:
+            type: object
+            nullable: true
+            description: TaskGrading when retained; null before completion or after expiry.
+            additionalProperties: true
+    GradingTasks:
+      type: object
+      required:
+      - tasks
+      properties:
+        tasks:
+          type: object
+          additionalProperties:
+            type: object
+            required:
+            - latest_run_id
+            - revision
+            - last_completed_run_id
+            - active_run
+            properties:
+              latest_run_id:
+                type: string
+                format: uuid
+                nullable: true
+              revision:
+                type: integer
+                minimum: 0
+              last_completed_run_id:
+                type: string
+                format: uuid
+                nullable: true
+              active_run:
+                type: object
+                nullable: true
+                description: Active run identity, revision, immutable start fields, state and started_at;
+                  null if inactive.
+                additionalProperties: true
+    LeaderboardEntry:
+      type: object
+      required:
+      - name
+      - tasks
+      - commit_hash
+      - status
+      - error
+      - stdout
+      - runtimes
+      - avg_runtime
+      - data
+      - reduction
+      - is_grading
+      - grading_started_at
+      - grading_commit_hash
+      - stdout_truncated
+      - stdout_original_bytes
+      properties:
+        name:
+          type: string
+        tasks:
+          type: array
+          items:
+            type: string
+        commit_hash:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/CommitHash'
+        status:
+          type: object
+          additionalProperties:
+            type: string
+            enum:
+            - graded
+            - error
+            - timeout
+        error:
+          type: object
+          additionalProperties:
+            type: string
+        stdout:
+          type: object
+          additionalProperties:
+            type: string
+        runtimes:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              type: number
+              minimum: 0
+        avg_runtime:
+          type: object
+          additionalProperties:
+            type: number
+            minimum: 0
+        data:
+          type: object
+          additionalProperties:
+            type: object
+            additionalProperties: true
+        reduction:
+          type: object
+          additionalProperties:
+            type: string
+        is_grading:
+          type: object
+          additionalProperties:
+            type: boolean
+        grading_started_at:
+          type: object
+          additionalProperties:
+            type: string
+            format: date-time
+            nullable: true
+        grading_commit_hash:
+          type: object
+          additionalProperties:
+            type: string
+            nullable: true
+        stdout_truncated:
+          type: object
+          additionalProperties:
+            type: boolean
+        stdout_original_bytes:
+          type: object
+          additionalProperties:
+            type: integer
+            minimum: 0
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+
+  responses:
+    SubmissionList:
+      description: Matching submissions.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [submissions]
+            properties:
+              submissions:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Submission"
+    GradingConflict:
+      description: Stale predecessor, active task, reused run ID, immutable result or cancellation conflict, invalid acknowledgement evidence, or version beyond recorded pushes.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    GradingTooLarge:
+      description: Grading request body exceeds 1 MiB.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    BadRequest:
+      description: Invalid input.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unauthorized:
+      description: Missing signature headers, signature not valid base64, or timestamp more than 60 seconds from server time.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Forbidden:
+      description: The signature doesn't match any authorized key.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: No such submission.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"

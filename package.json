@@ -1,0 +1,30 @@
+{
+  "name": "grader-worker",
+  "scripts": {
+    "test": "vitest run",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc -p .",
+    "cf-typegen": "wrangler types --strict-vars=false",
+    "db:migrate:local": "wrangler d1 migrations apply grader-db --local",
+    "db:migrate:remote": "wrangler d1 migrations apply grader-db --remote",
+    "admin": "python3 -m http.server 1313 --bind 127.0.0.1 --directory admin",
+    "admin-keys": "scripts/admin-keys.sh"
+  },
+  "type": "module",
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.4.0",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.11",
+    "wrangler": "^4.149.0"
+  },
+  "allowScripts": {
+    "workerd@1.20260815.1": true,
+    "workerd@1.20261006.1": true,
+    "esbuild@0.28.1": true,
+    "esbuild@0.28.2": true
+  },
+  "private": "true",
+  "description": "Cloudflare Worker that collects student submissions for MCPGrader",
+  "license": "GPL-3.0-or-later"
+}
